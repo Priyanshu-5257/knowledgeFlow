@@ -17,8 +17,8 @@ DRAFT_LAYER_TYPES = [
     "sliding_attention",
     "full_attention",
 ]
-# Last [S,S,S,F] block sits in front of the copied final norm + tied head.
-DEFAULT_LAYER_MAP = [24, 25, 26, 27]
+# Evenly spaced [S,S,S,F]: first layer sees embeddings, last is the original pre-head block.
+DEFAULT_LAYER_MAP = [0, 9, 18, 27]
 
 
 def patch_rope_validation() -> None:

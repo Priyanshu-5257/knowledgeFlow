@@ -237,7 +237,8 @@ def main():
             "match": match,
         }
         history.append(row)
-        if step == 1 or step % 10 == 0 or step == args.steps:
+        log_every = 50 if args.steps >= 500 else 10
+        if step == 1 or step % log_every == 0 or step == args.steps:
             print(row, "elapsed", round(time.time() - t0, 1), flush=True)
 
         del t_out, s_out, t_logits, s_logits, t_logits_s, loss, ce, kl
