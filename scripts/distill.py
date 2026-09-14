@@ -39,8 +39,8 @@ def chunked_reverse_kl(teacher_logits: torch.Tensor, student_logits: torch.Tenso
     for start in range(0, vocab, chunk):
         t_c = t[..., start : start + chunk]
         s_c = s[..., start : start + chunk]
-        t_logp = t_c - t_lse.unsqueeze(-1)
-        s_logp = s_c - s_lse.unsqueeze(-1)
+        t_logp = (t_c - t_lse.unsqueeze(-1)).clamp(min=-30)
+        s_logp = (s_c - s_lse.unsqueeze(-1)).clamp(min=-30)
         kl = kl + (t_logp.exp() * (t_logp - s_logp)).sum(dim=-1)
     return kl.mean()
 
@@ -125,8 +125,8 @@ def main():
     p.add_argument("--n", type=int, default=256)
     p.add_argument("--seq-len", type=int, default=256)
     p.add_argument("--steps", type=int, default=150)
-    p.add_argument("--lr", type=float, default=2e-5)
-    p.add_argument("--beta", type=float, default=0.5)
+    p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument("--beta", type=float, default=0.1)
     p.add_argument("--kl-chunk", type=int, default=4096)
     p.add_argument("--grad-accum", type=int, default=4)
     p.add_argument("--freeze-embed-steps", type=int, default=10**9)
@@ -182,9 +182,11 @@ def main():
 
     trainable = [p for p in student.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable, lr=args.lr)
+    scaler = torch.amp.GradScaler("cuda", enabled=s_dev.type == "cuda")
     history = []
     t0 = time.time()
     student.zero_grad(set_to_none=True)
+    skipped = 0
 
     for step in range(1, args.steps + 1):
         ids = seqs[(step - 1) % len(seqs)]
@@ -206,11 +208,19 @@ def main():
         )
         kl = chunked_reverse_kl(t_logits_s[:, :-1], s_logits[:, :-1], chunk=args.kl_chunk)
         loss = ce + args.beta * kl
-        (loss / args.grad_accum).backward()
+        if not torch.isfinite(loss):
+            skipped += 1
+            student.zero_grad(set_to_none=True)
+            print("skip non-finite loss at step", step, flush=True)
+            history.append({"step": step, "loss": None, "ce": None, "kl": None, "match": 0.0, "skipped": True})
+            continue
+        scaler.scale(loss / args.grad_accum).backward()
 
         if step % args.grad_accum == 0:
-            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-            opt.step()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(trainable, 0.5)
+            scaler.step(opt)
+            scaler.update()
             opt.zero_grad(set_to_none=True)
 
         if step == args.freeze_embed_steps:
@@ -239,9 +249,13 @@ def main():
     student.eval()
     tok.save_pretrained(out_dir)
     student.save_pretrained(out_dir)
-    first, last = history[0], history[-1]
+    finite = [r for r in history if isinstance(r.get("loss"), float) and r["loss"] == r["loss"]]
+    first, last = (finite[0], finite[-1]) if finite else (history[0], history[-1])
+    improved = False
+    if finite and isinstance(first.get("loss"), float) and isinstance(last.get("loss"), float):
+        improved = last["loss"] < first["loss"] * 0.98 or last["match"] > first["match"] + 0.01
     summary = {
-        "ok": last["loss"] < first["loss"] * 1.05 or last["match"] > first["match"],
+        "ok": bool(improved and skipped < args.steps // 2),
         "stage": args.stage,
         "teacher": teacher_id,
         "n_seq": len(seqs),
@@ -251,6 +265,7 @@ def main():
         "draft_params": count_params(student),
         "first": first,
         "last": last,
+        "skipped": skipped,
         "out": str(out_dir),
         "seconds": round(time.time() - t0, 1),
     }
