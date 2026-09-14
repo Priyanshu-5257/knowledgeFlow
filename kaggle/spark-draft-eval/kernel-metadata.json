@@ -1,0 +1,16 @@
+{
+  "id": "aivenger1st/spark-draft-eval",
+  "title": "spark-draft-eval",
+  "code_file": "spark-draft-eval.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "kernel_sources": ["aivenger1st/spark-draft-instruct-kd"],
+  "competition_sources": [],
+  "model_sources": [],
+  "machine_shape": "NvidiaTeslaT4"
+}
