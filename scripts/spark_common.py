@@ -73,3 +73,10 @@ def kaggle_out(path: str) -> str:
             return path
         return os.path.join("/kaggle/working", path)
     return path
+
+
+def teacher_student_devices():
+    if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
+        return torch.device("cuda:0"), torch.device("cuda:1")
+    dev = pick_device("auto")
+    return dev, dev
