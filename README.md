@@ -26,5 +26,6 @@ Curriculum: copy a 4-layer Spark (~474M) from **Base**, distill Base, then disti
 ```bash
 python scripts/build_draft.py --teacher XHToken/Spark-X2.5-1.7B-Base --out spark-x25-draft-0.5B-init
 python scripts/dump_teacher.py --teacher base --n 256 --out teacher_base.jsonl
-python scripts/distill.py --stage base --layer-map 0,9,18,27 --n 1024 --seq-len 256 --steps 2000 --out spark-x25-draft-0.5B-base-kd
+python scripts/distill.py --stage base --layer-map 0,9,18,27 --n 12000 --seq-len 256 --steps 100000 --max-seconds 27600 --out spark-x25-draft-0.5B-base-kd
+python scripts/distill.py --stage instruct --n 400 --seq-len 384 --max-new 128 --steps 100000 --max-seconds 27600 --out spark-x25-draft-0.5B-instruct-kd
 ```

@@ -15,6 +15,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_draft import copy_draft_weights, parse_layer_map
+from data_mix import interleave_packed, load_base_texts, load_instruct_prompts, round_robin_prompts
 from spark_common import (
     BASE_ID,
     DEFAULT_LAYER_MAP,
@@ -51,37 +52,10 @@ def token_match(teacher_logits: torch.Tensor, student_logits: torch.Tensor) -> f
     return float((t == s).float().mean().item())
 
 
-def packed_base_sequences(tok, n: int, max_len: int) -> list[list[int]]:
-    from datasets import load_dataset
-
-    wiki = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-    buf: list[int] = []
-    seqs: list[list[int]] = []
-    for row in wiki:
-        text = (row.get("text") or "").strip()
-        if not text:
-            continue
-        ids = tok(text, add_special_tokens=False)["input_ids"]
-        buf.extend(ids)
-        while len(buf) >= max_len:
-            seqs.append(buf[:max_len])
-            buf = buf[max_len:]
-            if len(seqs) >= n:
-                return seqs
-    if buf and len(seqs) < n:
-        pad_id = tok.pad_token_id or tok.eos_token_id or 0
-        seqs.append((buf + [pad_id] * max_len)[:max_len])
-    return seqs[:n]
-
-
-def generate_instruct_sequences(tok, teacher, device, n: int, max_len: int, max_new: int) -> list[list[int]]:
-    from datasets import load_dataset
-
-    gsm = load_dataset("gsm8k", "main", split="train")
+def generate_instruct_sequences(tok, teacher, device, prompts: list[str], max_len: int, max_new: int) -> list[list[int]]:
     seqs: list[list[int]] = []
     teacher.eval()
-    for i, row in enumerate(gsm):
-        q = row["question"]
+    for i, q in enumerate(prompts):
         messages = [{"role": "user", "content": q}]
         try:
             prompt = tok.apply_chat_template(
@@ -110,9 +84,7 @@ def generate_instruct_sequences(tok, teacher, device, n: int, max_len: int, max_
         if len(ids) >= 16:
             seqs.append(ids)
         if (i + 1) % 8 == 0:
-            print(f"instruct dump {len(seqs)}/{n}", flush=True)
-        if len(seqs) >= n:
-            break
+            print(f"instruct dump {len(seqs)}/{len(prompts)}", flush=True)
     return seqs
 
 
@@ -201,6 +173,10 @@ def main():
     p.add_argument("--out", default="spark-x25-draft-0.5B-base-kd")
     p.add_argument("--max-new", type=int, default=192)
     p.add_argument("--transplant-embed", action="store_true")
+    p.add_argument("--max-seconds", type=float, default=0.0)
+    p.add_argument("--save-every", type=int, default=2000)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--per-source", type=int, default=0)
     args = p.parse_args()
 
     teacher_id = args.teacher or (BASE_ID if args.stage == "base" else INSTRUCT_ID)
@@ -212,6 +188,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("devices teacher", t_dev, "student", s_dev, "stage", args.stage, flush=True)
+    wall0 = time.time()
     patch_rope_validation()
     tok = AutoTokenizer.from_pretrained(teacher_id, trust_remote_code=True)
     if tok.pad_token_id is None:
@@ -242,18 +219,25 @@ def main():
         student.gradient_checkpointing_enable()
         student.config.use_cache = False
 
+    mix_counts = {}
     if args.data:
         seqs = load_jsonl_ids(Path(args.data), args.seq_len)
     elif args.stage == "instruct":
-        print("generating instruct traces", args.n, "max_new", args.max_new, flush=True)
-        seqs = generate_instruct_sequences(tok, teacher, t_dev, args.n, args.seq_len, args.max_new)
+        per = args.per_source or max(32, args.n // 6 + 8)
+        print("loading instruct prompt mix per_source", per, flush=True)
+        sources = load_instruct_prompts(per)
+        prompts, mix_counts = round_robin_prompts(sources, args.n, seed=args.seed)
+        print("instruct prompts", len(prompts), mix_counts, flush=True)
+        seqs = generate_instruct_sequences(tok, teacher, t_dev, prompts, args.seq_len, args.max_new)
     else:
-        print("packing wikitext sequences", args.n, "x", args.seq_len, flush=True)
-        seqs = packed_base_sequences(tok, args.n, args.seq_len)
+        per = args.per_source or max(200, args.n // 6 + 50)
+        print("loading base text mix per_source", per, flush=True)
+        sources = load_base_texts(per)
+        seqs, mix_counts = interleave_packed(tok, sources, args.seq_len, args.n, seed=args.seed)
     if not seqs:
         raise SystemExit("no training sequences")
-    print("n_seq", len(seqs), "len0", len(seqs[0]), flush=True)
-    dump_path = Path(kaggle_out("teacher_base_packed.jsonl"))
+    print("n_seq", len(seqs), "len0", len(seqs[0]), "mix", mix_counts, flush=True)
+    dump_path = Path(kaggle_out("teacher_packed.jsonl"))
     with dump_path.open("w") as f:
         for i, ids in enumerate(seqs):
             f.write(json.dumps({"id": i, "teacher": args.stage, "input_ids": ids}) + "\n")
@@ -264,8 +248,43 @@ def main():
     t0 = time.time()
     student.zero_grad(set_to_none=True)
     skipped = 0
+    mix_counts = mix_counts if isinstance(mix_counts, dict) else {}
+
+    def write_ckpt(step: int, reason: str) -> None:
+        student.eval()
+        tok.save_pretrained(out_dir)
+        student.save_pretrained(out_dir)
+        finite = [r for r in history if isinstance(r.get("loss"), float) and r["loss"] == r["loss"]]
+        first, last = (finite[0], finite[-1]) if finite else ({}, {})
+        summary = {
+            "ok": True,
+            "stage": args.stage,
+            "teacher": teacher_id,
+            "n_seq": len(seqs),
+            "seq_len": args.seq_len,
+            "step": step,
+            "steps_target": args.steps,
+            "reason": reason,
+            "mix": mix_counts,
+            "beta": args.beta,
+            "draft_params": count_params(student),
+            "first": first,
+            "last": last,
+            "skipped": skipped,
+            "out": str(out_dir),
+            "seconds": round(time.time() - wall0, 1),
+            "train_seconds": round(time.time() - t0, 1),
+        }
+        Path(kaggle_out("distill_summary.json")).write_text(json.dumps(summary, indent=2))
+        (out_dir / "train_history.json").write_text(json.dumps(history))
+        (out_dir / "last_step.json").write_text(json.dumps({"step": step, "reason": reason}, indent=2))
+        print("checkpoint", reason, "step", step, flush=True)
+        student.train()
 
     for step in range(1, args.steps + 1):
+        if args.max_seconds and (time.time() - wall0) >= args.max_seconds:
+            write_ckpt(step - 1, "max_seconds")
+            break
         ids = seqs[(step - 1) % len(seqs)]
         x = torch.tensor(ids, dtype=torch.long).unsqueeze(0)
         t_x = x.to(t_dev)
@@ -319,37 +338,13 @@ def main():
             print(row, "elapsed", round(time.time() - t0, 1), flush=True)
 
         del t_out, s_out, t_logits, s_logits, t_logits_s, loss, ce, kl
-        if t_dev.type == "cuda":
+        if t_dev.type == "cuda" and step % 50 == 0:
             torch.cuda.empty_cache()
-
-    student.eval()
-    tok.save_pretrained(out_dir)
-    student.save_pretrained(out_dir)
-    finite = [r for r in history if isinstance(r.get("loss"), float) and r["loss"] == r["loss"]]
-    first, last = (finite[0], finite[-1]) if finite else (history[0], history[-1])
-    improved = False
-    if finite and isinstance(first.get("loss"), float) and isinstance(last.get("loss"), float):
-        improved = last["loss"] < first["loss"] * 0.98 or last["match"] > first["match"] + 0.01
-    summary = {
-        "ok": bool(improved and skipped < args.steps // 2),
-        "stage": args.stage,
-        "teacher": teacher_id,
-        "n_seq": len(seqs),
-        "seq_len": args.seq_len,
-        "steps": args.steps,
-        "beta": args.beta,
-        "draft_params": count_params(student),
-        "first": first,
-        "last": last,
-        "skipped": skipped,
-        "out": str(out_dir),
-        "seconds": round(time.time() - t0, 1),
-    }
-    Path(kaggle_out("distill_summary.json")).write_text(json.dumps(summary, indent=2))
-    (out_dir / "train_history.json").write_text(json.dumps(history))
-    print(json.dumps(summary, indent=2), flush=True)
-    if not summary["ok"]:
-        print("WARN: loss/match did not clearly improve; still wrote checkpoint", flush=True)
+        if args.save_every and step % args.save_every == 0:
+            write_ckpt(step, "periodic")
+    else:
+        write_ckpt(args.steps, "completed")
+    print("done", flush=True)
 
 
 if __name__ == "__main__":
