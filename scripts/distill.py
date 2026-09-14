@@ -74,6 +74,73 @@ def packed_base_sequences(tok, n: int, max_len: int) -> list[list[int]]:
     return seqs[:n]
 
 
+def generate_instruct_sequences(tok, teacher, device, n: int, max_len: int, max_new: int) -> list[list[int]]:
+    from datasets import load_dataset
+
+    gsm = load_dataset("gsm8k", "main", split="train")
+    seqs: list[list[int]] = []
+    teacher.eval()
+    for i, row in enumerate(gsm):
+        q = row["question"]
+        messages = [{"role": "user", "content": q}]
+        try:
+            prompt = tok.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+            )
+        except TypeError:
+            prompt = tok.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                chat_template_kwargs={"enable_thinking": True},
+            )
+        inputs = tok(prompt, return_tensors="pt", truncation=True, max_length=max_len - 32)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            gen = teacher.generate(
+                **inputs,
+                max_new_tokens=max_new,
+                do_sample=True,
+                temperature=1.0,
+                top_p=0.95,
+                top_k=50,
+                pad_token_id=tok.pad_token_id or tok.eos_token_id,
+            )
+        ids = gen[0].tolist()[:max_len]
+        if len(ids) >= 16:
+            seqs.append(ids)
+        if (i + 1) % 8 == 0:
+            print(f"instruct dump {len(seqs)}/{n}", flush=True)
+        if len(seqs) >= n:
+            break
+    return seqs
+
+
+def transplant_embeddings(teacher, student) -> None:
+    src = teacher.get_input_embeddings().weight.data
+    dst = student.get_input_embeddings().weight
+    if src.shape != dst.shape:
+        print("skip embed transplant shape", tuple(src.shape), tuple(dst.shape), flush=True)
+        return
+    dst.data.copy_(src.to(device=dst.device, dtype=dst.dtype))
+    print("transplanted instruct embeddings", tuple(dst.shape), flush=True)
+
+
+def resolve_draft_path(raw: str) -> str:
+    if raw and Path(raw).exists():
+        return raw
+    import glob
+
+    for pat in (
+        "/kaggle/input/**/spark-x25-draft-0.5B-base-kd/config.json",
+        "/kaggle/input/**/spark-x25-draft-0.5B-init/config.json",
+    ):
+        hits = glob.glob(pat, recursive=True)
+        if hits:
+            return str(Path(hits[0]).parent)
+    return raw
+
+
 def load_jsonl_ids(path: Path, max_len: int) -> list[list[int]]:
     seqs = []
     with path.open() as f:
@@ -132,6 +199,8 @@ def main():
     p.add_argument("--freeze-embed-steps", type=int, default=10**9)
     p.add_argument("--layer-map", default=",".join(str(i) for i in DEFAULT_LAYER_MAP))
     p.add_argument("--out", default="spark-x25-draft-0.5B-base-kd")
+    p.add_argument("--max-new", type=int, default=192)
+    p.add_argument("--transplant-embed", action="store_true")
     args = p.parse_args()
 
     teacher_id = args.teacher or (BASE_ID if args.stage == "base" else INSTRUCT_ID)
@@ -157,10 +226,15 @@ def main():
     fix_generation_config(teacher)
     print("teacher params", count_params(teacher), flush=True)
 
-    if args.draft_path:
-        student = load_draft(args.draft_path, s_dev, student_dtype)
+    draft_path = resolve_draft_path(args.draft_path)
+    if args.stage == "instruct" and not draft_path:
+        raise SystemExit("instruct stage requires a Base-KD draft (--draft-path or kaggle input)")
+    if draft_path:
+        student = load_draft(draft_path, s_dev, student_dtype)
     else:
         student = instantiate_draft(teacher, teacher_id, s_dev, student_dtype, layer_map)
+    if args.transplant_embed or args.stage == "instruct":
+        transplant_embeddings(teacher, student)
 
     freeze_embeddings(student, freeze=True)
     student.train()
@@ -170,6 +244,9 @@ def main():
 
     if args.data:
         seqs = load_jsonl_ids(Path(args.data), args.seq_len)
+    elif args.stage == "instruct":
+        print("generating instruct traces", args.n, "max_new", args.max_new, flush=True)
+        seqs = generate_instruct_sequences(tok, teacher, t_dev, args.n, args.seq_len, args.max_new)
     else:
         print("packing wikitext sequences", args.n, "x", args.seq_len, flush=True)
         seqs = packed_base_sequences(tok, args.n, args.seq_len)
