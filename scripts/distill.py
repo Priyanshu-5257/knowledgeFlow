@@ -136,7 +136,8 @@ def main():
 
     teacher_id = args.teacher or (BASE_ID if args.stage == "base" else INSTRUCT_ID)
     t_dev, s_dev = teacher_student_devices()
-    dtype = torch.float16 if t_dev.type == "cuda" else torch.float32
+    teacher_dtype = torch.float16 if t_dev.type == "cuda" else torch.float32
+    student_dtype = torch.float32
     layer_map = parse_layer_map(args.layer_map)
     out_dir = Path(kaggle_out(args.out))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -147,7 +148,7 @@ def main():
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
     teacher = AutoModelForCausalLM.from_pretrained(
-        teacher_id, trust_remote_code=True, torch_dtype=dtype, device_map=None
+        teacher_id, trust_remote_code=True, torch_dtype=teacher_dtype, device_map=None
     )
     teacher.to(t_dev)
     teacher.eval()
@@ -157,9 +158,9 @@ def main():
     print("teacher params", count_params(teacher), flush=True)
 
     if args.draft_path:
-        student = load_draft(args.draft_path, s_dev, dtype)
+        student = load_draft(args.draft_path, s_dev, student_dtype)
     else:
-        student = instantiate_draft(teacher, teacher_id, s_dev, dtype, layer_map)
+        student = instantiate_draft(teacher, teacher_id, s_dev, student_dtype, layer_map)
 
     freeze_embeddings(student, freeze=True)
     student.train()
@@ -182,7 +183,6 @@ def main():
 
     trainable = [p for p in student.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable, lr=args.lr)
-    scaler = torch.amp.GradScaler("cuda", enabled=s_dev.type == "cuda")
     history = []
     t0 = time.time()
     student.zero_grad(set_to_none=True)
@@ -214,13 +214,11 @@ def main():
             print("skip non-finite loss at step", step, flush=True)
             history.append({"step": step, "loss": None, "ce": None, "kl": None, "match": 0.0, "skipped": True})
             continue
-        scaler.scale(loss / args.grad_accum).backward()
+        (loss / args.grad_accum).backward()
 
         if step % args.grad_accum == 0:
-            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(trainable, 0.5)
-            scaler.step(opt)
-            scaler.update()
+            opt.step()
             opt.zero_grad(set_to_none=True)
 
         if step == args.freeze_embed_steps:

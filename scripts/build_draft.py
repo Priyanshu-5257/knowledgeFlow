@@ -49,14 +49,14 @@ def copy_draft_weights(teacher, draft, layer_map: list[int]) -> dict:
             if src_key not in src:
                 missing.append((key, src_key))
                 continue
-            new_sd[key] = src[src_key]
+            new_sd[key] = src[src_key].to(dtype=tensor.dtype)
             copied.append((key, src_key))
         else:
             if key in src and src[key].shape == tensor.shape:
-                new_sd[key] = src[key]
+                new_sd[key] = src[key].to(dtype=tensor.dtype)
                 copied.append((key, key))
             elif key == "lm_head.weight" and "model.embedding.weight" in src:
-                new_sd[key] = src["model.embedding.weight"]
+                new_sd[key] = src["model.embedding.weight"].to(dtype=tensor.dtype)
                 copied.append((key, "model.embedding.weight"))
             else:
                 missing.append((key, key))
