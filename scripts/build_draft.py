@@ -128,7 +128,9 @@ def main():
             out = draft.generate(
                 **inputs,
                 max_new_tokens=args.smoke_tokens,
-                do_sample=False,
+                do_sample=True,
+                temperature=1.0,
+                top_p=0.95,
                 top_k=50,
                 pad_token_id=tok.pad_token_id or tok.eos_token_id,
             )

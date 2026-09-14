@@ -33,6 +33,9 @@ def fix_generation_config(model, temperature: float = 1.0, top_p: float = 0.95, 
     cfg = getattr(model, "generation_config", None)
     if cfg is None:
         return
+    # Spark ships top_k=-1; HF generate() requires k>0. do_sample must be True
+    # or save_pretrained rejects top_p/temperature.
+    cfg.do_sample = True
     cfg.top_k = top_k
     cfg.temperature = temperature
     cfg.top_p = top_p
