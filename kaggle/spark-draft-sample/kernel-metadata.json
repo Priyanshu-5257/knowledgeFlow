@@ -1,0 +1,15 @@
+{
+  "id": "aivenger1st/spark-draft-sample",
+  "title": "spark-draft-sample",
+  "code_file": "spark-draft-sample.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "kernel_sources": ["aivenger1st/spark-draft-base-kd"],
+  "competition_sources": [],
+  "model_sources": []
+}
