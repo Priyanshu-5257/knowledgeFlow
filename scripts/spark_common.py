@@ -20,6 +20,27 @@ DRAFT_LAYER_TYPES = [
 # Evenly spaced [S,S,S,F]: first layer sees embeddings, last is the original pre-head block.
 DEFAULT_LAYER_MAP = [0, 9, 18, 27]
 
+# Qwen3.5-0.8B-like Spark draft: keep Spark2_5 + 131k vocab, 24 layers at hidden 1024.
+# 6 × [S,S,S,F] = 18 sliding + 6 full. Cannot copy 2048-d teacher layers.
+QWENLIKE_HIDDEN = 1024
+QWENLIKE_LAYERS = 24
+QWENLIKE_HEADS = 4
+QWENLIKE_KV_HEADS = 1
+QWENLIKE_INTERMEDIATE = 3584
+QWENLIKE_LAYER_TYPES = (DRAFT_LAYER_TYPES * 6)[:QWENLIKE_LAYERS]
+
+
+def apply_qwenlike_draft_config(cfg):
+    cfg.hidden_size = QWENLIKE_HIDDEN
+    cfg.intermediate_size = QWENLIKE_INTERMEDIATE
+    cfg.num_hidden_layers = QWENLIKE_LAYERS
+    cfg.num_attention_heads = QWENLIKE_HEADS
+    cfg.num_key_value_heads = QWENLIKE_KV_HEADS
+    cfg.head_dim = 256
+    cfg.layer_types = list(QWENLIKE_LAYER_TYPES)
+    cfg.tie_word_embeddings = True
+    return cfg
+
 
 def patch_rope_validation() -> None:
     try:

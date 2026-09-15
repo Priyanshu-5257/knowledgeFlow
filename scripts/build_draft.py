@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a 4-layer ~474M Spark2_5 draft by copying Base teacher weights."""
+"""Build a Spark2_5 draft: layer-pruned 1.7B copy, or Qwen3.5-0.8B-like 24×1024 net."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from spark_common import (
     BASE_ID,
     DEFAULT_LAYER_MAP,
     DRAFT_LAYER_TYPES,
+    QWENLIKE_LAYER_TYPES,
+    apply_qwenlike_draft_config,
     count_params,
     fix_generation_config,
     kaggle_out,
@@ -71,9 +73,23 @@ def copy_draft_weights(teacher, draft, layer_map: list[int]) -> dict:
     }
 
 
+def init_embed_from_teacher(teacher, draft) -> str:
+    """Width-halve teacher embeddings (2048 → 1024) by averaging pairs of dims."""
+    src = teacher.get_input_embeddings().weight.data
+    dst = draft.get_input_embeddings().weight
+    if src.shape[0] != dst.shape[0]:
+        return f"skip vocab mismatch {tuple(src.shape)} vs {tuple(dst.shape)}"
+    if src.shape[1] != dst.shape[1] * 2:
+        return f"skip hidden mismatch {tuple(src.shape)} vs {tuple(dst.shape)}"
+    pooled = src.view(src.shape[0], dst.shape[1], 2).mean(dim=-1)
+    dst.data.copy_(pooled.to(device=dst.device, dtype=dst.dtype))
+    return f"pooled embed {tuple(src.shape)} -> {tuple(dst.shape)}"
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--teacher", default=BASE_ID)
+    p.add_argument("--arch", choices=["prune", "qwenlike"], default="qwenlike")
     p.add_argument("--layer-map", default=",".join(str(i) for i in DEFAULT_LAYER_MAP))
     p.add_argument("--out", default="spark-x25-draft-0.5B-init")
     p.add_argument("--device", default="auto")
@@ -82,12 +98,11 @@ def main():
 
     device = pick_device(args.device)
     dtype = torch.float16 if device.type == "cuda" else torch.float32
-    layer_map = parse_layer_map(args.layer_map)
     out_dir = Path(kaggle_out(args.out))
     out_dir.mkdir(parents=True, exist_ok=True)
 
     patch_rope_validation()
-    print("loading teacher", args.teacher, "on", device, flush=True)
+    print("loading teacher", args.teacher, "on", device, "arch", args.arch, flush=True)
     tok = AutoTokenizer.from_pretrained(args.teacher, trust_remote_code=True)
     teacher = AutoModelForCausalLM.from_pretrained(
         args.teacher,
@@ -101,23 +116,32 @@ def main():
     print("teacher params B", count_params(teacher) / 1e9, flush=True)
 
     cfg = AutoConfig.from_pretrained(args.teacher, trust_remote_code=True)
-    cfg.num_hidden_layers = 4
-    cfg.layer_types = list(DRAFT_LAYER_TYPES)
-    draft = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True, torch_dtype=dtype)
-    draft.to(device)
-    report = copy_draft_weights(teacher, draft, layer_map)
+    report = {"arch": args.arch}
+    if args.arch == "qwenlike":
+        apply_qwenlike_draft_config(cfg)
+        draft = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True, torch_dtype=dtype)
+        draft.to(device)
+        report["embed_init"] = init_embed_from_teacher(teacher, draft)
+        report["layer_map"] = None
+        report["layer_types"] = list(QWENLIKE_LAYER_TYPES)
+    else:
+        cfg.num_hidden_layers = 4
+        cfg.layer_types = list(DRAFT_LAYER_TYPES)
+        layer_map = parse_layer_map(args.layer_map)
+        draft = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True, torch_dtype=dtype)
+        draft.to(device)
+        report.update(copy_draft_weights(teacher, draft, layer_map))
+        report["layer_types"] = list(DRAFT_LAYER_TYPES)
+        if report.get("load_missing"):
+            raise SystemExit(f"incomplete copy, missing {report['load_missing'][:12]}")
+
     draft.eval()
     fix_generation_config(draft)
     n_params = count_params(draft)
     print("draft params B", n_params / 1e9, "count", n_params, flush=True)
-    print("copy report", {k: report[k] for k in ("copied", "load_missing", "load_unexpected", "layer_map")}, flush=True)
-    if report["missing_src"]:
-        print("missing_src sample", report["missing_src"][:8], flush=True)
-
-    if not (4.2e8 < n_params < 5.6e8):
+    print("init report", {k: report[k] for k in report if k != "missing_src"}, flush=True)
+    if not (3.8e8 < n_params < 5.8e8):
         raise SystemExit(f"unexpected draft size {n_params}")
-    if report["load_missing"]:
-        raise SystemExit(f"incomplete copy, missing {report['load_missing'][:12]}")
 
     smoke = {"ok": False}
     if args.smoke_tokens > 0:
@@ -144,17 +168,23 @@ def main():
     meta = {
         "ok": True,
         "teacher": args.teacher,
-        "layer_map": layer_map,
-        "layer_types": list(DRAFT_LAYER_TYPES),
+        "arch": args.arch,
         "num_parameters": n_params,
-        "copy": {k: report[k] for k in ("copied", "load_missing", "load_unexpected", "missing_src")},
+        "hidden_size": int(cfg.hidden_size),
+        "num_hidden_layers": int(cfg.num_hidden_layers),
+        "num_attention_heads": int(cfg.num_attention_heads),
+        "num_key_value_heads": int(cfg.num_key_value_heads),
+        "intermediate_size": int(cfg.intermediate_size),
+        "layer_types": list(cfg.layer_types),
+        "init": {k: report[k] for k in report if k != "missing_src"},
         "smoke": smoke,
     }
     (out_dir / "draft_meta.json").write_text(json.dumps(meta, indent=2, default=str))
-    # also put a copy at kaggle working root for easy download
     root_meta = Path(kaggle_out("draft_build.json"))
     if root_meta.parent != out_dir:
-        root_meta.write_text(json.dumps({"ok": True, "out": str(out_dir), **{k: meta[k] for k in ("num_parameters", "layer_map", "smoke")}}, indent=2))
+        slim = {k: meta[k] for k in ("ok", "arch", "num_parameters", "hidden_size", "num_hidden_layers", "smoke")}
+        slim["out"] = str(out_dir)
+        root_meta.write_text(json.dumps(slim, indent=2))
     print("WROTE", out_dir, flush=True)
 
 
