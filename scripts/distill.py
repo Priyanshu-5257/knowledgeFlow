@@ -14,13 +14,14 @@ import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from build_draft import copy_draft_weights, parse_layer_map
+from build_draft import copy_draft_weights, init_embed_from_teacher, parse_layer_map
 from data_mix import interleave_packed, load_base_texts, load_instruct_prompts, round_robin_prompts
 from spark_common import (
     BASE_ID,
     DEFAULT_LAYER_MAP,
     DRAFT_LAYER_TYPES,
     INSTRUCT_ID,
+    apply_qwenlike_draft_config,
     count_params,
     fix_generation_config,
     kaggle_out,
@@ -124,17 +125,44 @@ def load_jsonl_ids(path: Path, max_len: int) -> list[list[int]]:
     return seqs
 
 
-def instantiate_draft(teacher, teacher_id: str, device, dtype, layer_map):
+def packed_wikitext(tok, n: int, max_len: int) -> list[list[int]]:
+    from datasets import load_dataset
+
+    wiki = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    buf: list[int] = []
+    seqs: list[list[int]] = []
+    for row in wiki:
+        text = (row.get("text") or "").strip()
+        if not text:
+            continue
+        ids = tok(text, add_special_tokens=False)["input_ids"]
+        buf.extend(ids)
+        while len(buf) >= max_len:
+            seqs.append(buf[:max_len])
+            buf = buf[max_len:]
+            if len(seqs) >= n:
+                return seqs
+    return seqs[:n]
+
+
+def instantiate_draft(teacher, teacher_id: str, device, dtype, layer_map, arch: str):
     cfg = AutoConfig.from_pretrained(teacher_id, trust_remote_code=True)
-    cfg.num_hidden_layers = 4
-    cfg.layer_types = list(DRAFT_LAYER_TYPES)
-    draft = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True, torch_dtype=dtype)
-    draft.to(device)
-    report = copy_draft_weights(teacher, draft, layer_map)
-    if report["load_missing"]:
-        raise SystemExit(f"incomplete copy {report['load_missing'][:8]}")
+    if arch == "qwenlike":
+        apply_qwenlike_draft_config(cfg)
+        draft = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True, torch_dtype=dtype)
+        draft.to(device)
+        msg = init_embed_from_teacher(teacher, draft)
+        print("qwenlike embed", msg, "params", count_params(draft), flush=True)
+    else:
+        cfg.num_hidden_layers = 4
+        cfg.layer_types = list(DRAFT_LAYER_TYPES)
+        draft = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True, torch_dtype=dtype)
+        draft.to(device)
+        report = copy_draft_weights(teacher, draft, layer_map)
+        if report["load_missing"]:
+            raise SystemExit(f"incomplete copy {report['load_missing'][:8]}")
+        print("built prune draft params", count_params(draft), "copied", report["copied"], flush=True)
     fix_generation_config(draft)
-    print("built draft params", count_params(draft), "copied", report["copied"], flush=True)
     return draft
 
 
@@ -177,13 +205,15 @@ def main():
     p.add_argument("--save-every", type=int, default=2000)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--per-source", type=int, default=0)
+    p.add_argument("--arch", choices=["prune", "qwenlike"], default="qwenlike")
+    p.add_argument("--wiki-only", action="store_true")
     args = p.parse_args()
 
     teacher_id = args.teacher or (BASE_ID if args.stage == "base" else INSTRUCT_ID)
     t_dev, s_dev = teacher_student_devices()
     teacher_dtype = torch.float16 if t_dev.type == "cuda" else torch.float32
     student_dtype = torch.float32
-    layer_map = parse_layer_map(args.layer_map)
+    layer_map = parse_layer_map(args.layer_map) if args.arch == "prune" else []
     out_dir = Path(kaggle_out(args.out))
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -209,7 +239,7 @@ def main():
     if draft_path:
         student = load_draft(draft_path, s_dev, student_dtype)
     else:
-        student = instantiate_draft(teacher, teacher_id, s_dev, student_dtype, layer_map)
+        student = instantiate_draft(teacher, teacher_id, s_dev, student_dtype, layer_map, args.arch)
     if args.transplant_embed or args.stage == "instruct":
         transplant_embeddings(teacher, student)
 
@@ -229,6 +259,10 @@ def main():
         prompts, mix_counts = round_robin_prompts(sources, args.n, seed=args.seed)
         print("instruct prompts", len(prompts), mix_counts, flush=True)
         seqs = generate_instruct_sequences(tok, teacher, t_dev, prompts, args.seq_len, args.max_new)
+    elif args.wiki_only:
+        print("packing wikitext-2", args.n, "x", args.seq_len, flush=True)
+        seqs = packed_wikitext(tok, args.n, args.seq_len)
+        mix_counts = {"wikitext-2": len(seqs)}
     else:
         per = args.per_source or max(200, args.n // 6 + 50)
         print("loading base text mix per_source", per, flush=True)

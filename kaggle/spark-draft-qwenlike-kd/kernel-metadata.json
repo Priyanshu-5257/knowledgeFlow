@@ -1,0 +1,16 @@
+{
+  "id": "aivenger1st/spark-draft-qwenlike-kd",
+  "title": "spark-draft-qwenlike-kd",
+  "code_file": "spark-draft-qwenlike-kd.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": [],
+  "machine_shape": "NvidiaTeslaT4"
+}
